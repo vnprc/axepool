@@ -355,6 +355,46 @@ async fn handle_miner(
                                             break;
                                         }
                                     },
+                                    "mining.suggest_difficulty" => {
+                                        // Extract the id and the suggested difficulty value.
+                                        let id = val.get("id").cloned().unwrap_or(Value::Null);
+                                        if let Some(params) = val.get("params").and_then(|p| p.as_array()) {
+                                            if let Some(suggested_diff) = params.get(0) {
+                                                // Respond to the suggestion.
+                                                let suggest_response = json!({
+                                                    "id": id,
+                                                    "result": true,
+                                                    "error": null
+                                                });
+                                                let resp_str = serde_json::to_string(&suggest_response).unwrap();
+                                                if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
+                                                    println!("Error writing mining.suggest_difficulty response to miner {}: {:?}", miner_id, e);
+                                                }
+                                                if let Err(e) = writer.write_all(b"\n").await {
+                                                    println!("Error writing newline to miner {}: {:?}", miner_id, e);
+                                                }
+                                                if let Err(e) = writer.flush().await {
+                                                    println!("Error flushing writer for miner {}: {:?}", miner_id, e);
+                                                }
+                                                // Now send out a mining.set_difficulty with the suggested value.
+                                                let set_diff = json!({
+                                                    "method": "mining.set_difficulty",
+                                                    "params": [suggested_diff],
+                                                    "id": null
+                                                });
+                                                let set_diff_str = serde_json::to_string(&set_diff).unwrap();
+                                                if let Err(e) = writer.write_all(set_diff_str.as_bytes()).await {
+                                                    println!("Error writing mining.set_difficulty to miner {}: {:?}", miner_id, e);
+                                                }
+                                                if let Err(e) = writer.write_all(b"\n").await {
+                                                    println!("Error writing newline for mining.set_difficulty to miner {}: {:?}", miner_id, e);
+                                                }
+                                                if let Err(e) = writer.flush().await {
+                                                    println!("Error flushing writer for miner {}: {:?}", miner_id, e);
+                                                }
+                                            }
+                                        }
+                                    },
                                     _ => {
                                         println!("Unhandled method {} from miner {}", method, miner_id);
                                     }
