@@ -116,69 +116,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ///   and extranonce2 size and store them in shared state.
 /// - If the message is a mining.notify, we broadcast it to all miners.
 async fn upstream_read_handler(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
+    reader: tokio::net::tcp::OwnedReadHalf,
     job_tx: broadcast::Sender<String>,
     job_params: SharedJobParams,
 ) {
-    let mut buf = vec![0; 4096];
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(n) if n == 0 => {
+        line.clear();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) => {
                 println!("Upstream closed connection");
                 break;
             }
-            Ok(n) => n,
+            Ok(_) => {
+                let trimmed = line.trim();
+                println!("Upstream message: {}", trimmed);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                    // Handle the JSON message as before.
+                    if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
+                        if method == "mining.notify" {
+                            let _ = job_tx.send(trimmed.to_string());
+                            continue;
+                        }
+                    }
+                    if let Some(id) = val.get("id").and_then(|v| v.as_u64()) {
+                        if id == 1 {
+                            if let Some(result) = val.get("result").and_then(|r| r.as_array()) {
+                                if result.len() >= 3 {
+                                    if let (Some(full_extranonce1), Some(extranonce2_size)) = (
+                                        result.get(1).and_then(|v| v.as_str()),
+                                        result.get(2).and_then(|v| v.as_u64()),
+                                    ) {
+                                        let params = JobParams {
+                                            coinb1: "".to_string(),
+                                            coinb2: "".to_string(),
+                                            full_extranonce1: full_extranonce1.to_string(),
+                                            extranonce2_size: extranonce2_size as usize,
+                                        };
+                                        let mut lock = job_params.lock().await;
+                                        *lock = Some(params);
+                                        println!("Stored upstream job parameters: {:?}", *lock);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    println!("Failed to parse JSON: {}", trimmed);
+                }
+            }
             Err(e) => {
                 println!("Error reading from upstream: {:?}", e);
                 break;
             }
-        };
-        let msg = String::from_utf8_lossy(&buf[..n]).to_string();
-        println!("Upstream message: {}", msg);
-
-        // Try to parse the JSON.
-        if let Ok(val) = serde_json::from_str::<Value>(&msg) {
-            if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
-                if method == "mining.notify" {
-                    // (In a real proxy, you would update coinb1/coinb2 here as well.)
-                    let _ = job_tx.send(msg.clone());
-                }
-            } else if val.get("result").is_some() {
-                // We assume this is the subscribe response from upstream.
-                // Expected format:
-                // {
-                //   "id": ...,
-                //   "result": [
-                //       [ ["mining.set_difficulty", "1"], ["mining.notify", "1"] ],
-                //       "full_extranonce1",
-                //       extranonce2_size
-                //   ],
-                //   "error": null
-                // }
-                if let Some(result) = val.get("result").and_then(|r| r.as_array()) {
-                    if result.len() >= 3 {
-                        if let (Some(full_extranonce1), Some(extranonce2_size)) = (
-                            result.get(1).and_then(|v| v.as_str()),
-                            result.get(2).and_then(|v| v.as_u64()),
-                        ) {
-                            // For demonstration, we’ll assume that the coinb1/coinb2
-                            // will later be provided in mining.notify messages.
-                            let params = JobParams {
-                                coinb1: "".to_string(),
-                                coinb2: "".to_string(),
-                                full_extranonce1: full_extranonce1.to_string(),
-                                extranonce2_size: extranonce2_size as usize,
-                            };
-                            let mut lock = job_params.lock().await;
-                            *lock = Some(params);
-                            println!("Stored upstream job parameters: {:?}", *lock);
-                        }
-                    }
-                }
-            }
         }
     }
 }
+
 
 /// Writes share submissions received from miners to the upstream pool.
 async fn upstream_write_handler(
@@ -211,7 +210,7 @@ async fn handle_miner(
     share_tx: mpsc::Sender<String>,
     job_params: SharedJobParams,
 ) {
-    // Assign a unique constrained extranonce (for example, 2 bytes in hex, i.e. 4 hex digits).
+    // Assign a unique constrained extranonce (e.g. 2 bytes in hex, i.e. 4 hex digits).
     let miner_id = MINER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let constrained_extranonce = format!("{:04x}", miner_id);
     println!(
@@ -222,71 +221,26 @@ async fn handle_miner(
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+    let mut subscribed = false;
 
-    // Read the miner’s subscribe request (e.g. mining.subscribe).
-    if let Ok(n) = reader.read_line(&mut line).await {
-        if n > 0 {
-            println!("Miner {} sent: {}", miner_id, line.trim_end());
-            // Wait until we have upstream job parameters.
-            let upstream_params = loop {
-                let lock = job_params.lock().await;
-                if let Some(ref params) = *lock {
-                    break params.clone();
-                }
-                drop(lock);
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            };
-
-            // Build the subscribe response for the miner using the constrained extranonce.
-            // (Note: the miner will now work only within the space defined by your proxy.)
-            let subscribe_response = json!({
-                "id": null,
-                "result": [
-                    [
-                        ["mining.set_difficulty", "1"],
-                        ["mining.notify", "1"]
-                    ],
-                    constrained_extranonce,  // Your assigned (constrained) extranonce1.
-                    upstream_params.extranonce2_size
-                ],
-                "error": null
-            });
-            let response_str = serde_json::to_string(&subscribe_response).unwrap();
-            if let Err(e) = writer.write_all(response_str.as_bytes()).await {
-                println!("Error writing subscribe response to miner {}: {:?}", miner_id, e);
-                return;
-            }
-            if let Err(e) = writer.write_all(b"\n").await {
-                println!("Error writing newline to miner {}: {:?}", miner_id, e);
-                return;
-            }
-            if let Err(e) = writer.flush().await {
-                println!("Error flushing writer for miner {}: {:?}", miner_id, e);
-                return;
-            }
-            line.clear();
-        }
-    } else {
-        println!("Failed to read subscription request from miner {}", miner_id);
-        return;
-    }
-
-    // Now process job notifications (mining.notify) and miner messages concurrently.
     loop {
         tokio::select! {
-            // When an upstream job (mining.notify) is broadcast, modify it for this miner.
+            // Branch for sending job notifications from upstream.
             Ok(job_msg) = job_rx.recv() => {
-                let modified_job = modify_job_for_miner(&job_msg, &constrained_extranonce);
-                if let Err(e) = writer.write_all(modified_job.as_bytes()).await {
-                    println!("Error sending job to miner {}: {:?}", miner_id, e);
-                    break;
-                }
-                if let Err(e) = writer.write_all(b"\n").await {
-                    println!("Error sending newline to miner {}: {:?}", miner_id, e);
-                    break;
+                // Only send notify messages if the miner has subscribed.
+                if subscribed {
+                    let modified_job = modify_job_for_miner(&job_msg, &constrained_extranonce);
+                    if let Err(e) = writer.write_all(modified_job.as_bytes()).await {
+                        println!("Error sending job to miner {}: {:?}", miner_id, e);
+                        break;
+                    }
+                    if let Err(e) = writer.write_all(b"\n").await {
+                        println!("Error sending newline to miner {}: {:?}", miner_id, e);
+                        break;
+                    }
                 }
             }
-            // Read messages from the miner (e.g. share submissions).
+            // Branch for reading messages from the miner.
             result = reader.read_line(&mut line) => {
                 match result {
                     Ok(0) => {
@@ -295,22 +249,94 @@ async fn handle_miner(
                     }
                     Ok(_) => {
                         println!("Received from miner {}: {}", miner_id, line.trim_end());
-                        // Assume this is a share submission.
-                        // To forward upstream, transform it by replacing the constrained extranonce
-                        // with the upstream full extranonce.
-                        let upstream_params = {
-                            let lock = job_params.lock().await;
-                            if let Some(ref params) = *lock {
-                                params.clone()
-                            } else {
-                                println!("No upstream parameters available for miner {}", miner_id);
-                                continue;
+                        // Parse the JSON message.
+                        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                            if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
+                                match method {
+                                    "mining.configure" => {
+                                        // Extract the id if present.
+                                        let id = val.get("id").cloned().unwrap_or(Value::Null);
+                                        // Respond with the full version-rolling mask.
+                                        let configure_response = json!({
+                                            "id": id,
+                                            "result": { "version-rolling.mask": "ffffffff" },
+                                            "error": null
+                                        });
+                                        let resp_str = serde_json::to_string(&configure_response).unwrap();
+                                        if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
+                                            println!("Error sending mining.configure response to miner {}: {:?}", miner_id, e);
+                                        }
+                                        if let Err(e) = writer.write_all(b"\n").await {
+                                            println!("Error sending newline to miner {}: {:?}", miner_id, e);
+                                        }
+                                        if let Err(e) = writer.flush().await {
+                                            println!("Error flushing writer for miner {}: {:?}", miner_id, e);
+                                        }
+                                    },
+                                    "mining.subscribe" => {
+                                        // Only handle subscription once.
+                                        if !subscribed {
+                                            // Wait for upstream job parameters.
+                                            let upstream_params = loop {
+                                                let lock = job_params.lock().await;
+                                                if let Some(ref params) = *lock {
+                                                    break params.clone();
+                                                }
+                                                drop(lock);
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                            };
+                                            // Build the subscribe response using the constrained extranonce.
+                                            let subscribe_response = json!({
+                                                "id": val.get("id").cloned().unwrap_or(Value::Null),
+                                                "result": [
+                                                    [
+                                                        ["mining.set_difficulty", "1"],
+                                                        ["mining.notify", "1"]
+                                                    ],
+                                                    constrained_extranonce, // Constrained extranonce1.
+                                                    upstream_params.extranonce2_size
+                                                ],
+                                                "error": null
+                                            });
+                                            let response_str = serde_json::to_string(&subscribe_response).unwrap();
+                                            if let Err(e) = writer.write_all(response_str.as_bytes()).await {
+                                                println!("Error writing subscribe response to miner {}: {:?}", miner_id, e);
+                                                break;
+                                            }
+                                            if let Err(e) = writer.write_all(b"\n").await {
+                                                println!("Error writing newline to miner {}: {:?}", miner_id, e);
+                                                break;
+                                            }
+                                            if let Err(e) = writer.flush().await {
+                                                println!("Error flushing writer for miner {}: {:?}", miner_id, e);
+                                                break;
+                                            }
+                                            println!("Sent subscribe response to miner {}", miner_id);
+                                            subscribed = true;
+                                        }
+                                    },
+                                    "mining.submit" => {
+                                        // Assume this is a share submission.
+                                        let upstream_params = {
+                                            let lock = job_params.lock().await;
+                                            if let Some(ref params) = *lock {
+                                                params.clone()
+                                            } else {
+                                                println!("No upstream parameters available for miner {}", miner_id);
+                                                continue;
+                                            }
+                                        };
+                                        let transformed_share = transform_share_submission(&line, &constrained_extranonce, &upstream_params.full_extranonce1);
+                                        if let Err(e) = share_tx.send(transformed_share).await {
+                                            println!("Error sending share from miner {} upstream: {:?}", miner_id, e);
+                                            break;
+                                        }
+                                    },
+                                    _ => {
+                                        println!("Unhandled method {} from miner {}", method, miner_id);
+                                    }
+                                }
                             }
-                        };
-                        let transformed_share = transform_share_submission(&line, &constrained_extranonce, &upstream_params.full_extranonce1);
-                        if let Err(e) = share_tx.send(transformed_share).await {
-                            println!("Error sending share from miner {} upstream: {:?}", miner_id, e);
-                            break;
                         }
                         line.clear();
                     }
@@ -323,6 +349,7 @@ async fn handle_miner(
         }
     }
 }
+
 
 /// Modifies an upstream job (mining.notify) for a miner by injecting the miner’s
 /// constrained extranonce into the coinbase.
