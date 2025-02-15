@@ -253,6 +253,29 @@ async fn handle_miner(
                         if let Ok(val) = serde_json::from_str::<Value>(&line) {
                             if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
                                 match method {
+                                    "mining.authorize" => {
+                                        // Respond with a positive authorization result.
+                                        let id = val.get("id").cloned().unwrap_or(json!(null));
+                                        let response = json!({
+                                            "id": id,
+                                            "result": true,
+                                            "error": null,
+                                        });
+                                        let response_str = serde_json::to_string(&response).unwrap();
+                                        if let Err(e) = writer.write_all(response_str.as_bytes()).await {
+                                            println!("Error writing authorize response to miner {}: {:?}", miner_id, e);
+                                            break;
+                                        }
+                                        if let Err(e) = writer.write_all(b"\n").await {
+                                            println!("Error writing newline to miner {}: {:?}", miner_id, e);
+                                            break;
+                                        }
+                                        if let Err(e) = writer.flush().await {
+                                            println!("Error flushing writer for miner {}: {:?}", miner_id, e);
+                                            break;
+                                        }
+                                        println!("Sent authorise response to miner {}", miner_id);
+                                    },
                                     "mining.configure" => {
                                         // Extract the id if present.
                                         let id = val.get("id").cloned().unwrap_or(Value::Null);
