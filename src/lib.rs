@@ -456,7 +456,6 @@ async fn handle_miner(
     loop {
         tokio::select! {
             Ok(job_msg) = job_rx.recv() => {
-                //let modified_job = modify_job_for_miner(&job_msg, &constrained_extranonce);
                 if let Err(e) = writer.write_all(job_msg.as_bytes()).await {
                     println!("Error sending job to miner {}: {:?}", miner_id, e);
                     break;
@@ -533,29 +532,6 @@ async fn handle_miner(
                 }
             }
         }
-    }
-}
-
-/// Modifies a mining.notify message by injecting the miner’s constrained extranonce.
-fn modify_job_for_miner(job: &str, constrained_extranonce: &str) -> String {
-    if let Ok(mut value) = serde_json::from_str::<Value>(job) {
-        if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-            if method == "mining.notify" {
-                if let Some(params) = value.get_mut("params").and_then(|p| p.as_array_mut()) {
-                    if params.len() >= 3 {
-                        if let (Some(coinb1), Some(coinb2)) =
-                            (params.get(1).and_then(|v| v.as_str()), params.get(2).and_then(|v| v.as_str()))
-                        {
-                            let modified_coinbase = format!("{}{}{}", coinb1, constrained_extranonce, coinb2);
-                            params[1] = Value::String(modified_coinbase);
-                        }
-                    }
-                }
-            }
-        }
-        serde_json::to_string(&value).unwrap_or_else(|_| job.to_string())
-    } else {
-        job.to_string()
     }
 }
 
