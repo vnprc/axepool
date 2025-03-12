@@ -24,12 +24,16 @@ type SharedLastNotify = Arc<Mutex<Option<String>>>;
 
 type SharedLastDifficulty = Arc<Mutex<Option<String>>>;
 
+type SharedLastPrevHash = Arc<Mutex<Option<String>>>;
+
 // An atomic counter to assign each miner a unique constrained extranonce.
 static MINER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn run_proxy(
     upstream_addr: &str,
     worker_name: &str,
+    on_new_block: Arc<dyn Fn(String) + Send + Sync + 'static>,
+    on_share_submitted: Arc<dyn Fn(String) + Send + Sync + 'static>,
 ) -> Result<(), Box<dyn Error>> {
     // Connect to the upstream pool.
     let mut upstream_stream = TcpStream::connect(&upstream_addr).await?;
@@ -85,12 +89,10 @@ pub async fn run_proxy(
     // Split the upstream connection.
     let (upstream_reader, upstream_writer) = upstream_stream.into_split();
 
-    // Shared state for upstream job parameters.
     let job_params: SharedJobParams = Arc::new(Mutex::new(None));
-    // Shared state for the latest mining.notify message.
     let last_notify: SharedLastNotify = Arc::new(Mutex::new(None));
-    // Shared state for the latest mining.set_difficutly message.
     let last_difficulty: SharedLastNotify = Arc::new(Mutex::new(None));
+    let last_prev_hash: SharedLastPrevHash = Arc::new(Mutex::new(None));
 
     // Broadcast channel for job (mining.notify) messages.
     let (job_tx, _) = broadcast::channel::<String>(16);
@@ -103,8 +105,9 @@ pub async fn run_proxy(
         let job_params = job_params.clone();
         let last_notify = last_notify.clone();
         let last_difficulty = last_difficulty.clone();
+        let last_prev_hash = last_prev_hash.clone();
         tokio::spawn(async move {
-            upstream_read_handler(upstream_reader, job_tx, job_params, last_notify, last_difficulty).await;
+            upstream_read_handler(upstream_reader, job_tx, job_params, last_notify, last_difficulty, on_new_block, last_prev_hash).await;
         });
     }
 
@@ -129,8 +132,9 @@ pub async fn run_proxy(
         let last_notify = last_notify.clone();
         let last_difficulty = last_difficulty.clone();
         let worker_name = worker_name.to_string();
+        let on_share_submitted = on_share_submitted.clone();
         tokio::spawn(async move {
-            handle_miner(miner_socket, job_tx.subscribe(), share_tx, job_params, last_notify, last_difficulty, worker_name).await;
+            handle_miner(miner_socket, job_tx.subscribe(), share_tx, job_params, last_notify, last_difficulty, worker_name, on_share_submitted).await;
         });
     }
 }
@@ -145,6 +149,8 @@ async fn upstream_read_handler(
     job_params: SharedJobParams,
     last_notify: SharedLastNotify,
     last_difficutly: SharedLastDifficulty,
+    on_new_block: Arc<dyn Fn(String) + Send + Sync + 'static>,
+    last_prev_hash: SharedLastPrevHash,
 ) {
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
@@ -165,6 +171,23 @@ async fn upstream_read_handler(
                     // Check if it's a mining.notify.
                     if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
                         if method == "mining.notify" {
+                            if let Some(params) = val.get("params").and_then(|p| p.as_array()) {
+                                if let Some(prevhash_json) = params.get(1) {
+                                    let new_prevhash = prevhash_json.as_str().unwrap_or("").to_string();
+
+
+                                    let mut last_hash_guard = last_prev_hash.lock().await;
+                                    let changed = match &*last_hash_guard {
+                                        Some(old_hash) => *old_hash != new_prevhash,
+                                        None           => true,
+                                    };
+
+                                    if changed {
+                                        *last_hash_guard = Some(new_prevhash);
+                                        on_new_block(trimmed.to_string());
+                                    }
+                                }
+                            }
                             {
                                 // Cache the most recent notify.
                                 let mut last_lock = last_notify.lock().await;
@@ -275,6 +298,7 @@ async fn handle_miner(
     last_notify: SharedLastNotify,
     last_difficulty: SharedLastDifficulty,
     worker_name: String,
+    on_share_submitted: Arc<dyn Fn(String) + Send + Sync + 'static>,
 ) {
     let miner_id = MINER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let constrained_extranonce = format!("{:04x}", miner_id);
@@ -463,6 +487,8 @@ async fn handle_miner(
                         if let Ok(value) = serde_json::from_str::<Value>(&line) {
                             if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                                 if method == "mining.submit" {
+                                    on_share_submitted(line.trim().to_string());
+
                                     let transformed_share = transform_share_submission(
                                         &line,
                                         &constrained_extranonce,
